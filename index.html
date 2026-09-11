@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#1b1b2f">
+<title>Bunny Winter</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    height: 100%; background: #1b1b2f; color: #eee; font-family: monospace;
+    overflow: hidden; touch-action: none; overscroll-behavior: none;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  }
+  #app {
+    height: 100vh; height: 100dvh; width: 100%;
+    display: flex; flex-direction: column; align-items: center;
+    padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom);
+  }
+  #stage { flex: 1 1 auto; width: 100%; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  canvas#game { image-rendering: pixelated; image-rendering: crisp-edges; background: #000; display: block; }
+  #controls {
+    flex: 0 0 auto; width: 100%; max-width: 440px;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 18px 14px; gap: 12px;
+  }
+  .dpad { display: grid; grid-template-columns: repeat(3, 54px); grid-template-rows: repeat(3, 54px); gap: 4px; }
+  .btn {
+    border: 0; border-radius: 12px; background: #3a3a5c; color: #fff; font-size: 22px;
+    font-family: inherit; touch-action: none; user-select: none; -webkit-user-select: none;
+    box-shadow: 0 4px 0 #22223a; cursor: pointer;
+  }
+  .btn.on { background: #6a6aa8; transform: translateY(2px); box-shadow: 0 2px 0 #22223a; }
+  .up { grid-column: 2; grid-row: 1; } .left { grid-column: 1; grid-row: 2; }
+  .right { grid-column: 3; grid-row: 2; } .down { grid-column: 2; grid-row: 3; }
+  .action {
+    width: 100px; height: 100px; border-radius: 50%; background: #d9772b;
+    box-shadow: 0 5px 0 #8f4a15; font-size: 15px; font-weight: bold; letter-spacing: 1px; line-height: 1.2;
+  }
+  .action.on { background: #f09040; box-shadow: 0 2px 0 #8f4a15; }
+  #hint { font-size: 11px; color: #8b8bb0; padding-bottom: 6px; text-align: center; }
+  @media (hover: none) and (pointer: coarse) { #hint { display: none; } }
+  @media (max-height: 560px) {
+    .dpad { grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(3, 44px); }
+    .action { width: 84px; height: 84px; }
+    #hint { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage"><canvas id="game" width="160" height="200"></canvas></div>
+  <div id="controls">
+    <div class="dpad">
+      <button class="btn up" data-k="up" aria-label="Up">&#9650;</button>
+      <button class="btn left" data-k="left" aria-label="Left">&#9664;</button>
+      <button class="btn right" data-k="right" aria-label="Right">&#9654;</button>
+      <button class="btn down" data-k="down" aria-label="Down">&#9660;</button>
+    </div>
+    <button class="btn action" id="action">STORE<br>CARROT</button>
+  </div>
+  <div id="hint">Keyboard: arrows / WASD to move &amp; dig, space to store</div>
+</div>
+<script>
+(() => {
+'use strict';
+// ---------- constants ----------
+const W = 160, H = 200, T = 8, COLS = 20, ROWS = 25;
+const SURF = 7;            // row the rabbit stands on when above ground
+const GROUND = 8;          // first ground row (grass)
+const DEN_TARGET = 12, CARROT_TARGET = 8, CARRY_MAX = 3;
+const SEASON = Math.max(5, +(new URLSearchParams(location.search).get("season")) || 120), DAY_LEN = SEASON / 12, SNOW_AT = SEASON * 0.3;
+const MOVE_INT = 0.14, DIG_INT = 0.16, DIG_HITS = 3;
+const MIN_STORE_ROW = GROUND + 2;
+const AIR = 0, DIRT = 1, GRASS = 2, STONE = 3, HOLE = 4, STORE = 5;
+
+// ---------- canvas ----------
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+const groundCv = document.createElement('canvas');
+groundCv.width = W; groundCv.height = H;
+const gctx = groundCv.getContext('2d');
+
+const stage = document.getElementById('stage');
+function fit() {
+  const r = stage.getBoundingClientRect();
+  const s = Math.max(0.5, Math.min(r.width / W, r.height / H));
+  cv.style.width = Math.floor(W * s) + 'px';
+  cv.style.height = Math.floor(H * s) + 'px';
+}
+if (window.ResizeObserver) new ResizeObserver(fit).observe(stage);
+window.addEventListener('resize', fit);
+fit();
+
+// ---------- palette & sprites ----------
+const PAL = { W: '#f6f6f6', K: '#1a1a1a', P: '#f2a0b8', O: '#e0762a', R: '#f08a1e', G: '#3e9a3a', L: '#7ac04a', S: '#8f9aa3', E: '#c9c9c9' };
+function sprite(rows, flip) {
+  const c = document.createElement('canvas'); c.width = 8; c.height = 8;
+  const x = c.getContext('2d');
+  rows.forEach((r, y) => { [...r].forEach((ch, i) => {
+    if (ch === '.') return; x.fillStyle = PAL[ch]; x.fillRect(flip ? 7 - i : i, y, 1, 1);
+  }); });
+  return c;
+}
+const RABBIT = [
+  '....W.W.',
+  '....W.W.',
+  '.WWWWWW.',
+  'WWWWWKW.',
+  'WWWWWWWP',
+  'WWWWWWW.',
+  '.WWWWW..',
+  '.W...W..'];
+const RABBIT_SLEEP = [
+  '........',
+  '........',
+  '..WW.W..',
+  '.WWWWWW.',
+  'WWWWWWW.',
+  'WWWWWWWP',
+  '.WWWWWW.',
+  '........'];
+const FOX = [
+  '....O.O.',
+  '....OOO.',
+  '.OOOOKO.',
+  'WOOOOOOK',
+  'OOOOOOO.',
+  'OOOOOOO.',
+  '.OO..OO.',
+  '.O....O.'];
+const CARROT = [
+  '..G.G...',
+  '...GG.G.',
+  '..GGGG..',
+  '..RRR...',
+  '..RRR...',
+  '..RRR...',
+  '...RR...',
+  '...R....'];
+const SPR = {
+  rabbitR: sprite(RABBIT, false), rabbitL: sprite(RABBIT, true),
+  sleepR: sprite(RABBIT_SLEEP, false), sleepL: sprite(RABBIT_SLEEP, true),
+  foxR: sprite(FOX, false), foxL: sprite(FOX, true),
+  carrot: sprite(CARROT, false)
+};
+
+// ---------- 3x5 pixel font ----------
+const FONT = {
+  A:'010101111101101',B:'110101110101110',C:'011100100100011',D:'110101101101110',E:'111100110100111',
+  F:'111100110100100',G:'011100101101011',H:'101101111101101',I:'111010010010111',J:'001001001101010',
+  K:'101101110101101',L:'100100100100111',M:'101111111101101',N:'110101101101101',O:'010101101101010',
+  P:'110101110100100',Q:'010101101110011',R:'110101110101101',S:'011100010001110',T:'111010010010010',
+  U:'101101101101011',V:'101101101101010',W:'101101111111101',X:'101101010101101',Y:'101101010010010',
+  Z:'111001010100111','0':'111101101101111','1':'010110010010111','2':'110001010100111','3':'110001010001110',
+  '4':'101101111001001','5':'111100110001110','6':'011100110101010','7':'111001010010010','8':'010101010101010',
+  '9':'010101011001110',' ':'000000000000000',':':'000010000010000','/':'001001010100100','!':'010010010000010',
+  '.':'000000000000010',',':'000000000010100','-':'000000111000000',"'":'010010000000000','?':'110001010000010',
+  '(':'010100100100010',')':'010001001001010','+':'000010111010000'
+};
+function text(s, x, y, col, sc) {
+  sc = sc || 1; ctx.fillStyle = col;
+  for (const ch of String(s).toUpperCase()) {
+    const g = FONT[ch];
+    if (g) for (let i = 0; i < 15; i++) if (g[i] === '1') ctx.fillRect(x + (i % 3) * sc, y + ((i / 3) | 0) * sc, sc, sc);
+    x += 4 * sc;
+  }
+}
+function textW(s, sc) { return (String(s).length * 4 - 1) * (sc || 1); }
+function textC(s, y, col, sc) { text(s, Math.floor((W - textW(s, sc)) / 2), y, col, sc); }
+function textS(s, x, y, col, sh, sc) { text(s, x + (sc || 1), y + (sc || 1), sh, sc); text(s, x, y, col, sc); }
+function textCS(s, y, col, sh, sc) { textS(s, Math.floor((W - textW(s, sc)) / 2), y, col, sh, sc); }
+
+// ---------- helpers ----------
+function noise(x, y) { const v = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453; return v - Math.floor(v); }
+function hex(c) { return [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16)]; }
+function lerpC(a, b, t) {
+  const A = hex(a), B = hex(b); t = Math.max(0, Math.min(1, t));
+  return 'rgb(' + A.map((v, i) => Math.round(v + (B[i] - v) * t)).join(',') + ')';
+}
+function pick(arr) { return arr[(Math.random() * arr.length) | 0]; }
+
+// ---------- audio ----------
+let AC = null;
+function audioInit() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; } }
+  if (AC && AC.state === 'suspended') AC.resume();
+}
+function beep(f, d, type, vol, when) {
+  if (!AC) return;
+  try {
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'square'; o.frequency.value = f;
+    o.connect(g); g.connect(AC.destination);
+    const t = AC.currentTime + (when || 0);
+    g.gain.setValueAtTime(vol || 0.05, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + d);
+    o.start(t); o.stop(t + d + 0.02);
+  } catch (e) {}
+}
+const SFX = {
+  pickup() { beep(880, 0.08); beep(1320, 0.1, 'square', 0.05, 0.07); },
+  store() { beep(523, 0.1, 'triangle', 0.08); beep(784, 0.15, 'triangle', 0.08, 0.1); },
+  dig() { beep(140, 0.06, 'sawtooth', 0.04); },
+  dug() { beep(220, 0.08, 'square', 0.04); },
+  fox() { beep(200, 0.15, 'sawtooth', 0.07); beep(150, 0.2, 'sawtooth', 0.07, 0.12); },
+  nope() { beep(180, 0.1, 'square', 0.04); },
+  win() { [523, 659, 784, 1047].forEach((f, i) => beep(f, 0.25, 'triangle', 0.08, i * 0.15)); },
+  lose() { [392, 349, 311, 262].forEach((f, i) => beep(f, 0.3, 'triangle', 0.08, i * 0.25)); }
+};
+
+// ---------- game state ----------
+let state = 'title';
+let map, rabbit, fox, carrots, stored, time, snow, parts, clouds, msgText, msgTime, endAt, win;
+let moveTimer, digTarget, digProgress, hopT, spawnT, groundDirty, hinted;
+
+function genMap() {
+  map = [];
+  for (let y = 0; y < ROWS; y++) {
+    const row = [];
+    for (let x = 0; x < COLS; x++) {
+      let t = AIR;
+      if (y === GROUND) t = GRASS;
+      else if (y > GROUND) t = (y >= GROUND + 2 && Math.random() < 0.09) ? STONE : DIRT;
+      row.push(t);
+    }
+    map.push(row);
+  }
+}
+function reset() {
+  genMap();
+  rabbit = { cx: 10, cy: SURF, face: 1, carrying: 0, invuln: 0 };
+  fox = { x: -40, dir: 1, turnT: 3 };
+  carrots = [];
+  for (let i = 0; i < 5; i++) spawnCarrot();
+  stored = 0; time = SEASON; snow = []; parts = []; win = false; endAt = 0;
+  clouds = [{ x: 20, y: 18, w: 14 }, { x: 90, y: 30, w: 18 }, { x: 140, y: 12, w: 10 }];
+  msgText = ''; msgTime = 0; moveTimer = MOVE_INT; digTarget = null; digProgress = 0; hopT = 0; spawnT = 3.5;
+  groundDirty = true; hinted = false;
+}
+function denSize() {
+  let n = 0;
+  for (let y = GROUND; y < ROWS; y++) for (let x = 0; x < COLS; x++) if (map[y][x] === HOLE || map[y][x] === STORE) n++;
+  return n;
+}
+function msg(s, t) { msgText = s; msgTime = t || 2; }
+function spawnCarrot() {
+  const free = [];
+  for (let x = 0; x < COLS; x++) if (!carrots.includes(x) && !(rabbit && rabbit.cy === SURF && rabbit.cx === x)) free.push(x);
+  if (free.length) carrots.push(pick(free));
+}
+function puff(x, y, col, n) {
+  for (let i = 0; i < n; i++) parts.push({ x: x + Math.random() * 8, y: y + Math.random() * 8, vx: (Math.random() - 0.5) * 30, vy: -20 - Math.random() * 30, life: 0.4 + Math.random() * 0.3, col });
+}
+
+// ---------- input ----------
+const held = { up: false, down: false, left: false, right: false };
+let order = [], actionQueued = false;
+function press(k) { if (!held[k]) { held[k] = true; order.push(k); } }
+function release(k) { held[k] = false; order = order.filter(o => o !== k); }
+function curDir() { for (let i = order.length - 1; i >= 0; i--) if (held[order[i]]) return order[i]; return null; }
+function releaseAll() { for (const k in held) release(k); document.querySelectorAll('.btn.on').forEach(b => b.classList.remove('on')); }
+
+document.querySelectorAll('.dpad .btn').forEach(el => {
+  const k = el.dataset.k;
+  el.addEventListener('pointerdown', e => {
+    e.preventDefault(); audioInit();
+    try { el.setPointerCapture(e.pointerId); } catch (err) {}
+    el.classList.add('on'); press(k);
+    if (state !== 'play') tryStart();
+  });
+  const up = e => { e.preventDefault(); el.classList.remove('on'); release(k); };
+  el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up); el.addEventListener('lostpointercapture', up);
+  el.addEventListener('contextmenu', e => e.preventDefault());
+});
+const actionBtn = document.getElementById('action');
+actionBtn.addEventListener('pointerdown', e => {
+  e.preventDefault(); audioInit(); actionBtn.classList.add('on');
+  try { actionBtn.setPointerCapture(e.pointerId); } catch (err) {}
+  if (state === 'play') actionQueued = true; else tryStart();
+});
+['pointerup', 'pointercancel', 'lostpointercapture'].forEach(ev => actionBtn.addEventListener(ev, e => { e.preventDefault(); actionBtn.classList.remove('on'); }));
+actionBtn.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('pointerdown', e => { e.preventDefault(); audioInit(); if (state !== 'play') tryStart(); });
+window.addEventListener('blur', releaseAll);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+
+const KEYS = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', w: 'up', s: 'down', a: 'left', d: 'right', W: 'up', S: 'down', A: 'left', D: 'right' };
+window.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  const k = KEYS[e.key];
+  if (k) { e.preventDefault(); audioInit(); press(k); if (state !== 'play') tryStart(); }
+  else if (e.key === ' ' || e.key === 'Enter' || e.key === 'e' || e.key === 'E') {
+    e.preventDefault(); audioInit();
+    if (state === 'play') actionQueued = true; else tryStart();
+  }
+});
+window.addEventListener('keyup', e => { const k = KEYS[e.key]; if (k) release(k); });
+
+function tryStart() {
+  if (state === 'title' || (state === 'end' && performance.now() - endAt > 1200)) {
+    reset(); state = 'play'; msg('PRESS DOWN TO DIG A DEN', 3.5);
+  }
+}
+
+// ---------- update ----------
+function step(dir) {
+  const dx = dir === 'left' ? -1 : dir === 'right' ? 1 : 0;
+  const dy = dir === 'up' ? -1 : dir === 'down' ? 1 : 0;
+  if (dx) rabbit.face = dx;
+  const tx = rabbit.cx + dx, ty = rabbit.cy + dy;
+  if (tx < 0 || tx >= COLS || ty < SURF || ty >= ROWS) { digProgress = 0; return; }
+  const t = map[ty][tx];
+  if (t === AIR || t === HOLE || t === STORE) {
+    rabbit.cx = tx; rabbit.cy = ty; hopT = 0.12; digProgress = 0; digTarget = null;
+    afterMove();
+  } else if (t === DIRT || t === GRASS) {
+    if (!digTarget || digTarget.x !== tx || digTarget.y !== ty) { digTarget = { x: tx, y: ty }; digProgress = 0; }
+    digProgress++;
+    puff(tx * T, ty * T, t === GRASS && digProgress < DIG_HITS ? '#4fa83c' : '#8a5a33', 3);
+    if (digProgress >= DIG_HITS) {
+      map[ty][tx] = HOLE; groundDirty = true; SFX.dug();
+      rabbit.cx = tx; rabbit.cy = ty; hopT = 0.12; digProgress = 0; digTarget = null;
+      const den = denSize();
+      if (den === DEN_TARGET) msg('DEN IS BIG ENOUGH!', 2.5);
+      else if (!hinted && ty >= MIN_STORE_ROW) { hinted = true; msg('DEEP ENOUGH TO STORE CARROTS', 3); }
+      afterMove();
+    } else SFX.dig();
+  } else if (t === STONE) {
+    digProgress = 0; SFX.nope(); msg('TOO HARD! A STONE.', 1.2);
+  }
+}
+function afterMove() {
+  if (rabbit.cy === SURF) {
+    const i = carrots.indexOf(rabbit.cx);
+    if (i >= 0) {
+      if (rabbit.carrying < CARRY_MAX) {
+        carrots.splice(i, 1); rabbit.carrying++; SFX.pickup();
+        puff(rabbit.cx * T, SURF * T, '#f08a1e', 4);
+        if (rabbit.carrying === CARRY_MAX) msg('PAWS FULL! STORE THEM UNDERGROUND', 2.5);
+      } else msg('PAWS FULL!', 1);
+    }
+  }
+}
+function doStore() {
+  if (rabbit.cy < GROUND) { msg('GO UNDERGROUND TO STORE', 1.5); SFX.nope(); return; }
+  if (rabbit.carrying === 0) { msg('NO CARROTS TO STORE', 1.5); SFX.nope(); return; }
+  if (rabbit.cy < MIN_STORE_ROW) { msg('TOO SHALLOW! DIG DEEPER', 1.5); SFX.nope(); return; }
+  if (map[rabbit.cy][rabbit.cx] === STORE) { msg('A CARROT IS ALREADY HERE', 1.5); SFX.nope(); return; }
+  map[rabbit.cy][rabbit.cx] = STORE; groundDirty = true;
+  rabbit.carrying--; stored++; SFX.store();
+  puff(rabbit.cx * T, rabbit.cy * T, '#ffd23f', 5);
+  msg(stored >= CARROT_TARGET ? 'PANTRY FULL!' : 'STORED ' + stored + '/' + CARROT_TARGET, 1.5);
+}
+function foxHit() {
+  rabbit.invuln = 2.5; SFX.fox();
+  if (rabbit.carrying > 0) { rabbit.carrying = 0; msg('THE FOX STOLE YOUR CARROTS!', 2.5); }
+  else msg('YIKES! HIDE UNDERGROUND!', 2);
+  puff(rabbit.cx * T, SURF * T, '#f08a1e', 6);
+}
+function dayNum() { return Math.ceil(time / DAY_LEN); }
+
+function update(dt) {
+  // clouds & snow drift in every state
+  clouds.forEach(c => { c.x += 2 * dt; if (c.x > W + 20) c.x = -c.w - 4; });
+  const snowing = state === 'end' || time < SNOW_AT;
+  if (snowing && snow.length < 60) snow.push({ x: Math.random() * W, y: -2, vx: (Math.random() - 0.5) * 6, vy: 10 + Math.random() * 14 });
+  snow.forEach(f => { f.x += f.vx * dt; f.y += f.vy * dt; });
+  snow = snow.filter(f => f.y < GROUND * T + 1);
+  parts.forEach(p => { p.vy += 90 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; });
+  parts = parts.filter(p => p.life > 0);
+  if (msgTime > 0) msgTime -= dt;
+  if (hopT > 0) hopT -= dt;
+  if (state !== 'play') return;
+
+  time -= dt;
+  if (time <= 0) { time = 0; endGame(); return; }
+  if (rabbit.invuln > 0) rabbit.invuln -= dt;
+
+  // rabbit movement
+  const dir = curDir();
+  if (dir) {
+    moveTimer += dt;
+    const interval = digTarget ? DIG_INT : MOVE_INT;
+    if (moveTimer >= interval) { moveTimer = 0; step(dir); }
+  } else { moveTimer = MOVE_INT; digTarget = null; digProgress = 0; }
+  if (actionQueued) { actionQueued = false; doStore(); }
+
+  // carrots regrow
+  spawnT -= dt;
+  if (spawnT <= 0) { spawnT = 3.5; if (carrots.length < 7) spawnCarrot(); }
+
+  // fox
+  const day = 12 - dayNum() + 1;
+  const speed = 15 + day * 1.5;
+  if (rabbit.cy === SURF) {
+    const tx = rabbit.cx * T;
+    if (Math.abs(tx - fox.x) > 0.5) { fox.dir = tx > fox.x ? 1 : -1; fox.x += fox.dir * speed * dt; }
+  } else {
+    fox.x += fox.dir * speed * 0.6 * dt;
+    fox.turnT -= dt;
+    if (fox.turnT <= 0) { fox.turnT = 2 + Math.random() * 4; if (Math.random() < 0.5) fox.dir *= -1; }
+  }
+  if (fox.x < -32) { fox.x = -32; fox.dir = 1; }
+  if (fox.x > W - 8) { fox.x = W - 8; fox.dir = -1; }
+  if (rabbit.cy === SURF && rabbit.invuln <= 0 && Math.abs(fox.x - rabbit.cx * T) < 6) foxHit();
+}
+function endGame() {
+  state = 'end'; endAt = performance.now(); releaseAll();
+  win = denSize() >= DEN_TARGET && stored >= CARROT_TARGET;
+  if (win) SFX.win(); else SFX.lose();
+}
+
+// ---------- drawing ----------
+function renderGround() {
+  gctx.clearRect(0, 0, W, H);
+  for (let y = GROUND; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+    const t = map[y][x], px = x * T, py = y * T;
+    if (t === HOLE || t === STORE) {
+      gctx.fillStyle = '#2a1a0e'; gctx.fillRect(px, py, T, T);
+      gctx.fillStyle = '#1c1108';
+      for (let k = 0; k < 2; k++) gctx.fillRect(px + ((noise(x + k, y) * 8) | 0), py + ((noise(y, x + k) * 8) | 0), 1, 1);
+      if (t === STORE) gctx.drawImage(SPR.carrot, px, py);
+      continue;
+    }
+    gctx.fillStyle = '#7a4b2a'; gctx.fillRect(px, py, T, T);
+    gctx.fillStyle = '#5e3a1f';
+    for (let k = 0; k < 3; k++) gctx.fillRect(px + ((noise(x * 8 + k, y) * 8) | 0), py + ((noise(y, x * 8 + k) * 8) | 0), 1, 1);
+    if (t === GRASS) {
+      gctx.fillStyle = '#4fa83c'; gctx.fillRect(px, py, T, 2);
+      gctx.fillStyle = '#7ac04a'; gctx.fillRect(px + (x % 3), py, 1, 1); gctx.fillRect(px + 4 + (x % 2), py + 2, 1, 1);
+    } else if (t === STONE) {
+      gctx.fillStyle = '#6f7a84'; gctx.fillRect(px + 1, py + 1, 6, 6);
+      gctx.fillStyle = '#8f9aa3'; gctx.fillRect(px + 2, py + 1, 4, 1); gctx.fillRect(px + 1, py + 2, 1, 4);
+      gctx.fillStyle = '#525b63'; gctx.fillRect(px + 2, py + 6, 5, 1); gctx.fillRect(px + 6, py + 3, 1, 3);
+    }
+  }
+  groundDirty = false;
+}
+function hill(cx, r, col) {
+  ctx.fillStyle = col;
+  for (let dy = 0; dy < r; dy++) {
+    const hw = Math.floor(Math.sqrt(r * r - dy * dy));
+    ctx.fillRect(cx - hw, GROUND * T - r + dy, hw * 2, 1);
+  }
+}
+function winterT() { return state === 'end' ? 1 : Math.max(0, Math.min(1, 1 - time / SNOW_AT)); }
+
+function draw() {
+  const wt = winterT();
+  // sky
+  ctx.fillStyle = lerpC('#8fc7ea', '#b9c3cc', wt); ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = lerpC('#a9d8f0', '#c9d1d8', wt); ctx.fillRect(0, 40, W, GROUND * T - 40);
+  // sun
+  ctx.fillStyle = lerpC('#ffd23f', '#e8e8e0', wt);
+  ctx.fillRect(138, 10, 6, 6); ctx.fillRect(137, 11, 8, 4); ctx.fillRect(139, 9, 4, 8);
+  // clouds
+  ctx.fillStyle = lerpC('#ffffff', '#dfe3e6', wt);
+  clouds.forEach(c => { ctx.fillRect(c.x | 0, c.y + 2, c.w, 3); ctx.fillRect((c.x | 0) + 3, c.y, c.w - 6, 2); });
+  // hills
+  hill(30, 18, lerpC('#5f9e3e', '#cfd6d8', wt));
+  hill(120, 24, lerpC('#568f38', '#c4ccd0', wt));
+  hill(75, 12, lerpC('#6aa946', '#d8dee0', wt));
+  // ground
+  if (groundDirty) renderGround();
+  ctx.drawImage(groundCv, 0, 0);
+  // snow cover on grass
+  if (wt > 0) {
+    ctx.globalAlpha = Math.min(1, wt * 1.2); ctx.fillStyle = '#f6f8fa';
+    for (let x = 0; x < COLS; x++) if (map[GROUND][x] === GRASS) ctx.fillRect(x * T, GROUND * T, T, 1 + (wt > 0.5 ? 1 : 0));
+    ctx.globalAlpha = 1;
+  }
+  // surface carrots
+  carrots.forEach(x => ctx.drawImage(SPR.carrot, x * T, SURF * T));
+  // fox
+  ctx.drawImage(fox.dir > 0 ? SPR.foxR : SPR.foxL, Math.round(fox.x), SURF * T);
+  // rabbit
+  const blink = rabbit.invuln > 0 && ((rabbit.invuln * 10) | 0) % 2 === 0;
+  if (!blink) {
+    const rx = rabbit.cx * T + (digTarget ? (digTarget.x - rabbit.cx) : 0), ry = rabbit.cy * T + (digTarget ? (digTarget.y - rabbit.cy) : 0) - (hopT > 0 ? 1 : 0);
+    let spr;
+    if (state === 'end') spr = rabbit.face > 0 ? SPR.sleepR : SPR.sleepL;
+    else spr = rabbit.face > 0 ? SPR.rabbitR : SPR.rabbitL;
+    ctx.drawImage(spr, rx, ry);
+    if (rabbit.carrying > 0 && state !== 'end') {
+      for (let i = 0; i < rabbit.carrying; i++) {
+        const bx = rx + 1 + i * 2, by = ry - 4;
+        ctx.fillStyle = '#3e9a3a'; ctx.fillRect(bx, by, 1, 1);
+        ctx.fillStyle = '#f08a1e'; ctx.fillRect(bx, by + 1, 1, 2);
+      }
+    }
+  }
+  // particles
+  parts.forEach(p => { ctx.fillStyle = p.col; ctx.fillRect(p.x | 0, p.y | 0, 1, 1); });
+  // snow
+  ctx.fillStyle = '#ffffff';
+  snow.forEach(f => ctx.fillRect(f.x | 0, f.y | 0, 1, 1));
+
+  if (state === 'title') { drawTitle(); return; }
+  drawHUD();
+  if (msgTime > 0 && msgText) {
+    ctx.fillStyle = 'rgba(20,20,40,0.75)'; ctx.fillRect(0, 26, W, 9);
+    textC(msgText, 28, '#ffffff');
+  }
+  if (state === 'end') drawEnd();
+}
+function drawHUD() {
+  const dark = '#1c2a3a', light = '#ffffff';
+  const days = dayNum();
+  textS(state === 'end' ? 'WINTER IS HERE' : 'WINTER IN ' + days + (days === 1 ? ' DAY' : ' DAYS'), 2, 2, light, dark);
+  // season bar
+  ctx.fillStyle = dark; ctx.fillRect(117, 2, 41, 6);
+  ctx.fillStyle = lerpC('#ffb347', '#dff4ff', 1 - time / SEASON); ctx.fillRect(118, 3, Math.round(39 * time / SEASON), 4);
+  const den = denSize();
+  textS('DEN ' + den + '/' + DEN_TARGET, 2, 10, den >= DEN_TARGET ? '#9cf59c' : light, dark);
+  textS('CARROTS ' + stored + '/' + CARROT_TARGET, 58, 10, stored >= CARROT_TARGET ? '#9cf59c' : light, dark);
+  textS('PAWS', 2, 18, light, dark);
+  for (let i = 0; i < CARRY_MAX; i++) {
+    const bx = 22 + i * 6, by = 17;
+    ctx.fillStyle = dark; ctx.fillRect(bx, by, 5, 7);
+    ctx.fillStyle = i < rabbit.carrying ? '#f08a1e' : '#4a5a6a'; ctx.fillRect(bx + 1, by + 2, 3, 4);
+    ctx.fillStyle = i < rabbit.carrying ? '#3e9a3a' : '#4a5a6a'; ctx.fillRect(bx + 2, by + 1, 1, 1);
+  }
+}
+function box(y, h) { ctx.fillStyle = 'rgba(20,20,40,0.82)'; ctx.fillRect(4, y, W - 8, h); ctx.fillStyle = '#ffffff'; ctx.fillRect(4, y, W - 8, 1); ctx.fillRect(4, y + h - 1, W - 8, 1); }
+function drawTitle() {
+  box(8, 100);
+  textCS('BUNNY WINTER', 14, '#ffffff', '#f08a1e', 2);
+  textC('GET READY FOR THE COLD!', 30, '#ffd23f');
+  textC('DIG A DEN OF ' + DEN_TARGET + ' TILES', 42, '#ffffff');
+  textC('COLLECT CARROTS UP TOP', 50, '#ffffff');
+  textC('STORE ' + CARROT_TARGET + ' OF THEM DEEP DOWN', 58, '#ffffff');
+  textC('BEFORE WINTER COMES', 66, '#ffffff');
+  textC('WATCH OUT FOR THE FOX!', 78, '#f0a060');
+  if (((performance.now() / 500) | 0) % 2 === 0) textC('TAP TO START', 94, '#9cf59c');
+}
+function drawEnd() {
+  const den = denSize();
+  box(36, win ? 62 : 72);
+  textCS('WINTER IS HERE!', 40, '#ffffff', '#4a90c0', 1);
+  if (win) {
+    textC('SNUG DEN, FULL PANTRY', 52, '#9cf59c');
+    textC('YOU WIN!', 62, '#ffd23f', 2);
+  } else {
+    textC('BRRR... NOT READY!', 52, '#ff9c9c');
+    let ly = 62;
+    if (den < DEN_TARGET) { textC('DEN TOO SMALL ' + den + '/' + DEN_TARGET, ly, '#ffffff'); ly += 8; }
+    if (stored < CARROT_TARGET) { textC('ONLY ' + stored + '/' + CARROT_TARGET + ' CARROTS', ly, '#ffffff'); ly += 8; }
+  }
+  if (performance.now() - endAt > 1200 && ((performance.now() / 500) | 0) % 2 === 0) textC('TAP TO PLAY AGAIN', win ? 86 : 96, '#9cf59c');
+}
+
+// ---------- loop ----------
+reset();
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  update(dt); draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
